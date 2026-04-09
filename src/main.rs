@@ -1371,9 +1371,11 @@ impl Server {
                 }
             }
 
-            // Set read timeout for non-blocking receive
+            // Short read timeout so heartbeats are sent frequently enough
+            // (CT devices drop the connection after ~15s idle)
+            let recv_timeout = std::cmp::min(poll_secs, 5);
             dev.stream
-                .set_read_timeout(Some(Duration::from_secs(poll_secs)))
+                .set_read_timeout(Some(Duration::from_secs(recv_timeout)))
                 .ok();
 
             // Send first heartbeat immediately to trigger dp 6 streaming
@@ -1384,7 +1386,8 @@ impl Server {
 
             let mut last_heartbeat = SystemTime::now();
             let mut last_publish = SystemTime::now();
-            let heartbeat_interval = Duration::from_secs(poll_secs);
+            // Heartbeat every 7s to keep CT devices alive (they timeout at ~15s)
+            let heartbeat_interval = Duration::from_secs(std::cmp::min(poll_secs, 7));
             let publish_interval = Duration::from_secs(poll_secs);
 
             // Main loop: receive STATUS pushes, send heartbeats, publish
