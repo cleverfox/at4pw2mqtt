@@ -1,14 +1,17 @@
 # tuya-meter
 
-Minimal Rust tool to read [AT4P-W](https://www.aliexpress.com/item/1005007218498498.html) (and similar) Tuya smart power meters **locally**, without cloud access. Includes an MQTT bridge with Home Assistant / OpenHAB auto-discovery.
+Minimal Rust tool to read [AT4P-W](https://www.aliexpress.com/item/1005007218498498.html) and SA1 CT clamp Tuya smart power meters **locally**, without cloud access. Includes an MQTT bridge with Home Assistant / OpenHAB auto-discovery and JSONL logging with rotation.
 
 ## Features
 
 - Direct LAN communication via Tuya protocol 3.3 / 3.4 / 3.5
 - No Python, no dependencies — single static binary (~400 KB)
+- Supports AT4P-W plug meter and SA1 CT clamp meter (auto-detected)
 - Reads all meter data: voltage, current, power, energy, frequency, power factor, leakage current, temperature
+- Server mode with MQTT and/or JSONL logging (can run both simultaneously)
 - MQTT bridge with [Home Assistant MQTT Discovery](https://www.home-assistant.io/integrations/mqtt/#mqtt-discovery)
-- Switch control (on/off) via MQTT commands
+- JSONL log rotation by line count and/or time interval
+- Switch control (on/off) via MQTT commands (AT4P-W only)
 - IPv6 support
 
 ## Supported data points
@@ -67,18 +70,26 @@ tuya-meter config.yaml on
 tuya-meter config.yaml off
 ```
 
-### MQTT bridge
+### Server mode (MQTT + logging)
 
 ```bash
-# Start MQTT bridge (runs forever, polls every N seconds)
-tuya-meter config.yaml mqtt
+# Start server (runs forever, polls every N seconds)
+tuya-meter config.yaml server
 ```
 
-The bridge:
+Server mode requires at least one of `mqtt` or `log` sections in config. It can run both simultaneously.
+
+**MQTT bridge:**
 1. Publishes HA discovery configs so sensors appear automatically
 2. Polls the meter and publishes state to `home/<node_id>/state`
-3. Subscribes to `home/<node_id>/switch/set` for ON/OFF commands
+3. Subscribes to `home/<node_id>/switch/set` for ON/OFF commands (AT4P-W only)
 4. Publishes availability to `home/<node_id>/availability` (with LWT)
+
+**JSONL logging:**
+- Writes one JSON line per poll: `{"t": 1712678400, "data": {"voltage": "230.1", ...}}`
+- Rotation by line count (`max_lines`) and/or time interval (`rotate_interval`)
+- Keeps up to 3 rotated files (`.1`, `.2`, `.3`)
+- Intervals: `"5h"`, `"1d"`, `"30m"`, `"3600s"`
 
 ## Getting your `local_key`
 
