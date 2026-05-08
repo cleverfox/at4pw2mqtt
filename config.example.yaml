@@ -11,6 +11,10 @@ device:
 
 poll_secs: 10                # How often to poll the meter (seconds)
 
+# bcast_addr: 192.168.1.255  # Optional: subnet-directed broadcast for ip: auto.
+                             # Defaults to a /24 derived from your local IP.
+                             # Set explicitly if your LAN isn't /24 (e.g. 10.0.0.255 for /16).
+
 # Optional: MQTT bridge with Home Assistant auto-discovery
 # Remove this section if you only need CLI / log-only mode
 mqtt:

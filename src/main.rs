@@ -334,7 +334,11 @@ fn refresh_arp_cache() {
     std::thread::sleep(Duration::from_millis(1500));
 }
 
-fn discover_via_udp(device_id: &str, timeout_secs: u64) -> Result<String, String> {
+fn discover_via_udp(
+    device_id: &str,
+    bcast_override: Option<&str>,
+    timeout_secs: u64,
+) -> Result<String, String> {
     let key = tuya_udp_key();
 
     let sock_6666 = UdpSocket::bind("0.0.0.0:6666")
@@ -354,19 +358,32 @@ fn discover_via_udp(device_id: &str, timeout_secs: u64) -> Result<String, String
     // Sender socket on an ephemeral port — broadcast a v3.5 REQ_DEVINFO probe so
     // devices that don't auto-broadcast (or only broadcast at boot) reply with
     // their info. tinytuya does the same on a 6 s cadence.
-    let probe_sock = UdpSocket::bind("0.0.0.0:0")
+    //
+    // Bind to the local interface IP rather than 0.0.0.0: on FreeBSD/Linux the
+    // limited broadcast 255.255.255.255 has no obvious interface and the kernel
+    // routes it via the default gateway (sending to the gateway's unicast MAC
+    // instead of ff:ff:ff:ff:ff:ff). Binding pins the egress interface; sending
+    // to the subnet-directed broadcast (e.g. 192.168.1.255) ensures L2 broadcast.
+    let self_ipv4 = local_ipv4().unwrap_or(std::net::Ipv4Addr::new(0, 0, 0, 0));
+    let probe_sock = UdpSocket::bind((self_ipv4, 0u16))
+        .or_else(|_| UdpSocket::bind("0.0.0.0:0"))
         .map_err(|e| format!("bind ephemeral UDP: {e}"))?;
     probe_sock.set_broadcast(true).ok();
-    let self_ip = local_ipv4()
-        .map(|i| i.to_string())
-        .unwrap_or_else(|| "0.0.0.0".into());
-    let probe = build_discovery_probe(&self_ip, &key);
-    let probe_targets = ["255.255.255.255:7000"];
+    let probe = build_discovery_probe(&self_ipv4.to_string(), &key);
+
+    let mut probe_targets: Vec<String> = vec!["255.255.255.255:7000".into()];
+    if let Some(b) = bcast_override {
+        probe_targets.push(format!("{b}:7000"));
+    } else if self_ipv4.octets()[0] != 0 {
+        let o = self_ipv4.octets();
+        // Assume /24 — covers virtually every home LAN.
+        probe_targets.push(format!("{}.{}.{}.255:7000", o[0], o[1], o[2]));
+    }
     let probe_interval = Duration::from_secs(5);
 
     let send_probe = |sock: &UdpSocket| {
         for t in &probe_targets {
-            let _ = sock.send_to(&probe, *t);
+            let _ = sock.send_to(&probe, t);
         }
     };
 
@@ -425,6 +442,7 @@ fn discover_via_udp(device_id: &str, timeout_secs: u64) -> Result<String, String
 fn discover_device_ip(
     device_id: &str,
     mac: Option<&str>,
+    bcast_override: Option<&str>,
     udp_timeout_secs: u64,
 ) -> Result<String, String> {
     if let Some(mac_str) = mac {
@@ -444,7 +462,7 @@ fn discover_device_ip(
             eprintln!("Invalid mac '{mac_str}' in config; skipping ARP lookup");
         }
     }
-    discover_via_udp(device_id, udp_timeout_secs)
+    discover_via_udp(device_id, bcast_override, udp_timeout_secs)
 }
 
 // ── Config ──
@@ -458,6 +476,10 @@ struct Config {
     log: Option<LogConfig>,
     #[serde(default = "default_poll_secs")]
     poll_secs: Option<u64>,
+    /// Override the subnet-directed broadcast address used by `ip: auto`
+    /// discovery. Defaults to a /24 derived from the local interface IP.
+    #[serde(default)]
+    bcast_addr: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize)]
@@ -1385,6 +1407,7 @@ struct Server {
     dev_type: DeviceType,
     poll_secs: u64,
     auto_ip: bool,
+    bcast_addr: Option<String>,
 }
 
 impl Server {
@@ -1654,6 +1677,7 @@ impl Server {
                         match discover_device_ip(
                             &self.dev.id,
                             self.dev.mac.as_deref(),
+                            self.bcast_addr.as_deref(),
                             AUTO_IP_DISCOVERY_TIMEOUT_SECS,
                         ) {
                             Ok(ip) => {
@@ -1814,6 +1838,7 @@ fn main() {
         match discover_device_ip(
             &cfg.device.id,
             cfg.device.mac.as_deref(),
+            cfg.bcast_addr.as_deref(),
             AUTO_IP_DISCOVERY_TIMEOUT_SECS,
         ) {
             Ok(ip) => {
@@ -1868,6 +1893,7 @@ fn main() {
             dev_type,
             poll_secs,
             auto_ip,
+            bcast_addr: cfg.bcast_addr,
         };
         server.run();
         return;

@@ -210,6 +210,14 @@ device:
 
 In server mode the IP is also re-resolved after a connect failure, so devices that move across DHCP leases keep working without a config edit.
 
+If your LAN isn't a /24 (the default assumption), set the subnet-directed broadcast explicitly:
+
+```yaml
+bcast_addr: 10.0.255.255    # for a /16; use whatever matches your subnet mask
+```
+
+This is also a useful workaround on FreeBSD/Linux, where the kernel won't L2-broadcast `255.255.255.255` without a hint and would otherwise unicast the probe to the default gateway.
+
 ## Protocol notes
 
 Tuya devices communicate over TCP port 6668 using a custom binary protocol:
