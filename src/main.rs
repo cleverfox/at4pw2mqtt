@@ -3,12 +3,13 @@ use aes_gcm::{aead::KeyInit as GcmKeyInit, AeadInPlace, Aes128Gcm, Nonce as GcmN
 use cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyInit};
 use crc32fast::Hasher as Crc32Hasher;
 use hmac::{Hmac, Mac};
+use md5::{Digest as Md5Digest, Md5};
 use rumqttc::{Client, MqttOptions, QoS};
 use sha2::Sha256;
 use std::env;
 use std::fs;
 use std::io::{Read, Write, BufWriter, BufRead, BufReader};
-use std::net::TcpStream;
+use std::net::{TcpStream, UdpSocket};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -116,6 +117,17 @@ fn aes_ecb_encrypt_block(key: &[u8; 16], block: &[u8; 16]) -> [u8; 16] {
     result
 }
 
+fn aes_ecb_decrypt_safe(key: &[u8; 16], data: &[u8]) -> Option<Vec<u8>> {
+    if data.is_empty() || data.len() % 16 != 0 {
+        return None;
+    }
+    let mut buf = data.to_vec();
+    Aes128EcbDec::new(key.into())
+        .decrypt_padded_mut::<Pkcs7>(&mut buf)
+        .ok()
+        .map(|s| s.to_vec())
+}
+
 // ── CRC32 ──
 
 fn crc32(data: &[u8]) -> u32 {
@@ -133,6 +145,306 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(&result.into_bytes());
     out
+}
+
+// ── UDP discovery ──
+//
+// Tuya devices broadcast their presence on:
+//   UDP 6666 — AES-ECB encrypted (v3.1–3.4)
+//   UDP 7000 — AES-GCM encrypted (v3.5)
+// Both use a fixed key derived from a hardcoded constant.
+
+const AUTO_IP_DISCOVERY_TIMEOUT_SECS: u64 = 60;
+
+fn tuya_udp_key() -> [u8; 16] {
+    let mut h = Md5::new();
+    h.update(b"yGAdlopoPVldABfn");
+    let r = h.finalize();
+    let mut k = [0u8; 16];
+    k.copy_from_slice(&r);
+    k
+}
+
+fn parse_55aa_broadcast(pkt: &[u8], key: &[u8; 16]) -> Option<Vec<u8>> {
+    // Header(16) = prefix(4) + seq(4) + cmd(4) + length(4)
+    // length covers payload + CRC(4) + suffix(4); broadcasts have no retcode.
+    if pkt.len() < 24 {
+        return None;
+    }
+    let prefix = u32::from_be_bytes(pkt[0..4].try_into().ok()?);
+    if prefix != PREFIX_55AA {
+        return None;
+    }
+    let length = u32::from_be_bytes(pkt[12..16].try_into().ok()?) as usize;
+    if length < 8 || 16 + length > pkt.len() {
+        return None;
+    }
+    let enc_end = 16 + length - 8;
+    let enc = &pkt[16..enc_end];
+    aes_ecb_decrypt_safe(key, enc)
+}
+
+fn parse_6699_broadcast(pkt: &[u8], key: &[u8; 16]) -> Option<Vec<u8>> {
+    // Header(18) = prefix(4) + reserved(2) + seq(4) + cmd(4) + length(4)
+    // After header: IV(12) + ciphertext + tag(16); then suffix(4).
+    if pkt.len() < 22 {
+        return None;
+    }
+    let prefix = u32::from_be_bytes(pkt[0..4].try_into().ok()?);
+    if prefix != PREFIX_6699 {
+        return None;
+    }
+    let length = u32::from_be_bytes(pkt[14..18].try_into().ok()?) as usize;
+    if length < 28 || 18 + length + 4 > pkt.len() {
+        return None;
+    }
+    let iv = &pkt[18..30];
+    let aad = &pkt[4..18];
+    let ct_end = 18 + length - 16;
+    let ct = &pkt[30..ct_end];
+    let tag = &pkt[ct_end..ct_end + 16];
+
+    let gcm = Aes128Gcm::new(key.into());
+    let nonce = GcmNonce::from_slice(iv);
+    let mut buf = ct.to_vec();
+    use aes_gcm::aead::generic_array::GenericArray;
+    let tag_arr = GenericArray::clone_from_slice(tag);
+    gcm.decrypt_in_place_detached(nonce, aad, &mut buf, &tag_arr)
+        .ok()?;
+    Some(buf)
+}
+
+fn extract_broadcast_json(payload: &[u8]) -> Option<serde_json::Value> {
+    use serde::Deserialize;
+    let start = payload.iter().position(|&b| b == b'{')?;
+    let mut de = serde_json::Deserializer::from_slice(&payload[start..]);
+    serde_json::Value::deserialize(&mut de).ok()
+}
+
+const CMD_REQ_DEVINFO: u32 = 0x25;
+
+/// Build a v3.5 discovery probe packet (cmd 0x25, AES-GCM with udpkey).
+/// v3.5 devices answer this with their broadcast info on UDP 7000.
+fn build_discovery_probe(self_ip: &str, key: &[u8; 16]) -> Vec<u8> {
+    let payload = format!("{{\"from\":\"app\",\"ip\":\"{self_ip}\"}}");
+    let payload_bytes = payload.into_bytes();
+
+    let ts = format!("{}", (now_secs() as f64 * 10.0) as u64);
+    let iv_bytes: Vec<u8> = ts.bytes().take(12).collect();
+    let mut iv = [0u8; 12];
+    let copy_len = iv_bytes.len().min(12);
+    iv[..copy_len].copy_from_slice(&iv_bytes[..copy_len]);
+
+    let length = payload_bytes.len() as u32 + 16 + 12;
+
+    let mut header = Vec::with_capacity(18);
+    header.extend_from_slice(&PREFIX_6699.to_be_bytes());
+    header.extend_from_slice(&0u16.to_be_bytes());
+    header.extend_from_slice(&0u32.to_be_bytes()); // seqno = 0
+    header.extend_from_slice(&CMD_REQ_DEVINFO.to_be_bytes());
+    header.extend_from_slice(&length.to_be_bytes());
+
+    let aad = header[4..18].to_vec();
+
+    let gcm = Aes128Gcm::new(key.into());
+    let nonce = GcmNonce::from_slice(&iv);
+    let mut buffer = payload_bytes;
+    let tag = gcm
+        .encrypt_in_place_detached(nonce, &aad, &mut buffer)
+        .unwrap();
+
+    let mut msg = header;
+    msg.extend_from_slice(&iv);
+    msg.extend_from_slice(&buffer);
+    msg.extend_from_slice(&tag);
+    msg.extend_from_slice(&SUFFIX_6699.to_be_bytes());
+    msg
+}
+
+fn parse_mac(s: &str) -> Option<[u8; 6]> {
+    let s = s.trim().to_lowercase().replace('-', ":");
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 6 {
+        return None;
+    }
+    let mut out = [0u8; 6];
+    for (i, p) in parts.iter().enumerate() {
+        out[i] = u8::from_str_radix(p, 16).ok()?;
+    }
+    Some(out)
+}
+
+fn lookup_ip_by_mac(target: [u8; 6]) -> Option<String> {
+    let out = std::process::Command::new("arp")
+        .args(["-an"])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for line in stdout.lines() {
+        let ip = match (line.find('('), line.find(')')) {
+            (Some(a), Some(b)) if b > a + 1 => &line[a + 1..b],
+            _ => continue,
+        };
+        let after_at = match line.find(" at ") {
+            Some(idx) => &line[idx + 4..],
+            None => continue,
+        };
+        let mac_str = after_at.split_whitespace().next().unwrap_or("");
+        if let Some(mac) = parse_mac(mac_str) {
+            if mac == target {
+                if ip.parse::<std::net::Ipv4Addr>().is_ok() {
+                    return Some(ip.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn local_ipv4() -> Option<std::net::Ipv4Addr> {
+    // Connecting a UDP socket gives us the source IP the kernel would use for that route.
+    let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("8.8.8.8:53").ok()?;
+    match sock.local_addr().ok()? {
+        std::net::SocketAddr::V4(v4) => Some(*v4.ip()),
+        _ => None,
+    }
+}
+
+/// Send a tiny UDP packet to every host on our /24, prompting the kernel to
+/// resolve each MAC. Online hosts populate the ARP cache; offline hosts time
+/// out silently. Returns once packets are sent and a brief settle delay elapses.
+fn refresh_arp_cache() {
+    let my_ip = match local_ipv4() {
+        Some(ip) => ip,
+        None => return,
+    };
+    let o = my_ip.octets();
+    let sock = match UdpSocket::bind("0.0.0.0:0") {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    for i in 1u8..255 {
+        if i == o[3] {
+            continue;
+        }
+        let dst = format!("{}.{}.{}.{}:9", o[0], o[1], o[2], i);
+        let _ = sock.send_to(&[0u8], dst);
+    }
+    std::thread::sleep(Duration::from_millis(1500));
+}
+
+fn discover_via_udp(device_id: &str, timeout_secs: u64) -> Result<String, String> {
+    let key = tuya_udp_key();
+
+    let sock_6666 = UdpSocket::bind("0.0.0.0:6666")
+        .map_err(|e| format!("bind UDP 6666: {e}"))?;
+    sock_6666
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .ok();
+    sock_6666.set_broadcast(true).ok();
+
+    let sock_7000 = UdpSocket::bind("0.0.0.0:7000")
+        .map_err(|e| format!("bind UDP 7000: {e}"))?;
+    sock_7000
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .ok();
+    sock_7000.set_broadcast(true).ok();
+
+    // Sender socket on an ephemeral port — broadcast a v3.5 REQ_DEVINFO probe so
+    // devices that don't auto-broadcast (or only broadcast at boot) reply with
+    // their info. tinytuya does the same on a 6 s cadence.
+    let probe_sock = UdpSocket::bind("0.0.0.0:0")
+        .map_err(|e| format!("bind ephemeral UDP: {e}"))?;
+    probe_sock.set_broadcast(true).ok();
+    let self_ip = local_ipv4()
+        .map(|i| i.to_string())
+        .unwrap_or_else(|| "0.0.0.0".into());
+    let probe = build_discovery_probe(&self_ip, &key);
+    let probe_targets = ["255.255.255.255:7000"];
+    let probe_interval = Duration::from_secs(5);
+
+    let send_probe = |sock: &UdpSocket| {
+        for t in &probe_targets {
+            let _ = sock.send_to(&probe, *t);
+        }
+    };
+
+    eprintln!(
+        "Probing for {device_id} on UDP 6666/7000 (active scan, up to {timeout_secs}s)..."
+    );
+    send_probe(&probe_sock);
+    let mut last_probe = SystemTime::now();
+
+    let deadline = SystemTime::now() + Duration::from_secs(timeout_secs);
+    let mut buf = [0u8; 4096];
+
+    loop {
+        let now = SystemTime::now();
+        if now > deadline {
+            return Err(format!(
+                "no broadcast received from device {device_id} within {timeout_secs}s"
+            ));
+        }
+        if now.duration_since(last_probe).unwrap_or_default() >= probe_interval {
+            send_probe(&probe_sock);
+            last_probe = now;
+        }
+
+        for (sock, port, decode) in [
+            (
+                &sock_6666,
+                6666u16,
+                parse_55aa_broadcast as fn(&[u8], &[u8; 16]) -> Option<Vec<u8>>,
+            ),
+            (&sock_7000, 7000u16, parse_6699_broadcast),
+        ] {
+            if let Ok((n, addr)) = sock.recv_from(&mut buf) {
+                let payload = match decode(&buf[..n], &key) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let json = match extract_broadcast_json(&payload) {
+                    Some(j) => j,
+                    None => continue,
+                };
+                let gw_id = json.get("gwId").and_then(|v| v.as_str()).unwrap_or("");
+                if gw_id == device_id {
+                    let ip = match addr.ip() {
+                        std::net::IpAddr::V4(v4) => v4.to_string(),
+                        std::net::IpAddr::V6(v6) => v6.to_string(),
+                    };
+                    eprintln!("Found {device_id} at {ip} (UDP {port})");
+                    return Ok(ip);
+                }
+            }
+        }
+    }
+}
+
+fn discover_device_ip(
+    device_id: &str,
+    mac: Option<&str>,
+    udp_timeout_secs: u64,
+) -> Result<String, String> {
+    if let Some(mac_str) = mac {
+        if let Some(target) = parse_mac(mac_str) {
+            if let Some(ip) = lookup_ip_by_mac(target) {
+                eprintln!("Found {device_id} at {ip} (ARP cache, MAC {mac_str})");
+                return Ok(ip);
+            }
+            eprintln!("MAC {mac_str} not in ARP cache; sweeping subnet...");
+            refresh_arp_cache();
+            if let Some(ip) = lookup_ip_by_mac(target) {
+                eprintln!("Found {device_id} at {ip} (ARP after sweep, MAC {mac_str})");
+                return Ok(ip);
+            }
+            eprintln!("MAC not found via ARP; falling back to UDP broadcast");
+        } else {
+            eprintln!("Invalid mac '{mac_str}' in config; skipping ARP lookup");
+        }
+    }
+    discover_via_udp(device_id, udp_timeout_secs)
 }
 
 // ── Config ──
@@ -164,6 +476,8 @@ struct DeviceConfig {
     version: String,
     #[serde(default)]
     device_type: Option<DeviceType>,
+    #[serde(default)]
+    mac: Option<String>,
 }
 
 fn default_version() -> String {
@@ -1070,6 +1384,7 @@ struct Server {
     logger: Option<JsonlLogger>,
     dev_type: DeviceType,
     poll_secs: u64,
+    auto_ip: bool,
 }
 
 impl Server {
@@ -1335,6 +1650,21 @@ impl Server {
                             .publish(&avail_topic, QoS::AtLeastOnce, true, "offline")
                             .ok();
                     }
+                    if self.auto_ip {
+                        match discover_device_ip(
+                            &self.dev.id,
+                            self.dev.mac.as_deref(),
+                            AUTO_IP_DISCOVERY_TIMEOUT_SECS,
+                        ) {
+                            Ok(ip) => {
+                                if ip != self.dev.ip {
+                                    eprintln!("IP changed: {} -> {ip}", self.dev.ip);
+                                }
+                                self.dev.ip = ip;
+                            }
+                            Err(de) => eprintln!("Re-discovery failed: {de}"),
+                        }
+                    }
                     std::thread::sleep(Duration::from_secs(poll_secs));
                     continue;
                 }
@@ -1465,7 +1795,7 @@ fn main() {
     let config_path = args.get(1).map(|s| s.as_str()).unwrap_or("config.yaml");
     let command = args.get(2).map(|s| s.as_str()).unwrap_or("status");
 
-    let cfg = match load_config(config_path) {
+    let mut cfg = match load_config(config_path) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -1478,6 +1808,24 @@ fn main() {
 
     let version = parse_version(&cfg.device.version);
     let poll_secs = cfg.poll_secs.unwrap_or(10);
+    let auto_ip = cfg.device.ip.eq_ignore_ascii_case("auto");
+
+    if auto_ip {
+        match discover_device_ip(
+            &cfg.device.id,
+            cfg.device.mac.as_deref(),
+            AUTO_IP_DISCOVERY_TIMEOUT_SECS,
+        ) {
+            Ok(ip) => {
+                eprintln!("Resolved {} -> {ip}", cfg.device.id);
+                cfg.device.ip = ip;
+            }
+            Err(e) => {
+                eprintln!("Auto IP discovery failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
 
     if command == "server" || command == "mqtt" {
         if cfg.mqtt.is_none() && cfg.log.is_none() {
@@ -1519,6 +1867,7 @@ fn main() {
             logger,
             dev_type,
             poll_secs,
+            auto_ip,
         };
         server.run();
         return;

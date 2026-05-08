@@ -192,6 +192,24 @@ nmap -p 6668 192.168.1.0/24
 # Or check your router's DHCP table
 ```
 
+### Auto-discovery (DHCP-friendly)
+
+Set `ip: auto` in the config and the tool will resolve the IP at startup. Two strategies, tried in order:
+
+1. **MAC lookup** (when `mac:` is set in the config) — reads the system ARP table, sweeps the local /24 to refresh stale entries, then matches the device's MAC. This is fast and works for devices that don't broadcast.
+2. **UDP broadcast** — listens on UDP **6666** (v3.1–3.4, AES-ECB) and **7000** (v3.5, AES-GCM) and matches by `id` (`gwId`). Devices broadcast every ~5–10 s when active; some firmwares broadcast rarely or only at boot.
+
+```yaml
+device:
+  ip: auto
+  id: your_device_id_here
+  local_key: your_local_key
+  version: "3.5"
+  mac: "aa:bb:cc:dd:ee:ff"   # optional, enables ARP-based lookup
+```
+
+In server mode the IP is also re-resolved after a connect failure, so devices that move across DHCP leases keep working without a config edit.
+
 ## Protocol notes
 
 Tuya devices communicate over TCP port 6668 using a custom binary protocol:

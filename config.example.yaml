@@ -2,10 +2,11 @@
 # Copy this file to config.yaml and fill in your values
 
 device:
-  ip: 192.168.1.100          # Device IP on your LAN
+  ip: 192.168.1.100          # Device IP on your LAN, or "auto" to discover (see below)
   id: your_device_id_here    # Tuya device ID (from IoT Platform)
   local_key: your_local_key  # 16-char local key (from IoT Platform)
   version: "3.5"             # Protocol version: "3.3", "3.4", or "3.5"
+  # mac: "aa:bb:cc:dd:ee:ff" # Optional, used by ip: auto for ARP-based lookup
   # device_type: at4pw       # Optional: "at4pw" or "ct" (auto-detected if omitted)
 
 poll_secs: 10                # How often to poll the meter (seconds)
