@@ -555,9 +555,75 @@ fn parse_interval(s: &str) -> Result<u64, String> {
     Ok(n * suffix)
 }
 
+// ── Date formatting for log filenames (strftime-style, no extra deps) ──
+
+/// Days since 1970-01-01 → (year, month, day). Howard Hinnant's civil_from_days.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Local UTC offset in seconds, via `date +%z` (e.g. "+0300"). Falls back to UTC.
+fn local_utc_offset_secs() -> i64 {
+    if let Ok(out) = std::process::Command::new("date").arg("+%z").output() {
+        let s = String::from_utf8_lossy(&out.stdout);
+        let s = s.trim();
+        if s.len() == 5 {
+            let sign = if s.starts_with('-') { -1 } else { 1 };
+            if let (Ok(h), Ok(m)) = (s[1..3].parse::<i64>(), s[3..5].parse::<i64>()) {
+                return sign * (h * 3600 + m * 60);
+            }
+        }
+    }
+    0
+}
+
+/// Expand %Y %m %d %H %M %S (and %%) in a log file pattern using local time.
+fn format_log_path(pattern: &str, epoch_secs: u64, tz_offset_secs: i64) -> String {
+    let t = epoch_secs as i64 + tz_offset_secs;
+    let (year, month, day) = civil_from_days(t.div_euclid(86400));
+    let secs = t.rem_euclid(86400);
+    let (hh, mm, ss) = (secs / 3600, (secs / 60) % 60, secs % 60);
+
+    let mut out = String::with_capacity(pattern.len() + 8);
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('Y') => out.push_str(&format!("{year:04}")),
+            Some('m') => out.push_str(&format!("{month:02}")),
+            Some('d') => out.push_str(&format!("{day:02}")),
+            Some('H') => out.push_str(&format!("{hh:02}")),
+            Some('M') => out.push_str(&format!("{mm:02}")),
+            Some('S') => out.push_str(&format!("{ss:02}")),
+            Some('%') => out.push('%'),
+            Some(other) => {
+                out.push('%');
+                out.push(other);
+            }
+            None => out.push('%'),
+        }
+    }
+    out
+}
+
 // ── JSONL Logger with rotation ──
 
 struct JsonlLogger {
+    pattern: String,
+    dated: bool, // pattern contains % specifiers
+    tz_offset_secs: i64,
     path: PathBuf,
     max_lines: Option<u64>,
     rotate_interval_secs: Option<u64>,
@@ -576,8 +642,13 @@ impl JsonlLogger {
             .duration_since(UNIX_EPOCH).unwrap().as_secs();
         let interval_n = interval_secs.map(|i| now_secs / i).unwrap_or(0);
 
-        let path = PathBuf::from(&cfg.file);
+        let dated = cfg.file.contains('%');
+        let tz_offset_secs = if dated { local_utc_offset_secs() } else { 0 };
+        let path = PathBuf::from(format_log_path(&cfg.file, now_secs, tz_offset_secs));
         let mut logger = JsonlLogger {
+            pattern: cfg.file.clone(),
+            dated,
+            tz_offset_secs,
             path,
             max_lines: cfg.max_lines,
             rotate_interval_secs: interval_secs,
@@ -631,10 +702,25 @@ impl JsonlLogger {
     }
 
     fn check_rotation(&mut self) -> Result<(), String> {
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH).unwrap().as_secs();
+        // Date-patterned filename: switch to the new file when the name changes
+        if self.dated {
+            let new_path = PathBuf::from(format_log_path(
+                &self.pattern, now_secs, self.tz_offset_secs,
+            ));
+            if new_path != self.path {
+                self.writer = None;
+                eprintln!(
+                    "Log file switched: {} -> {}",
+                    self.path.display(), new_path.display()
+                );
+                self.path = new_path;
+                self.open_or_resume()?;
+            }
+        }
         // Check time-based rotation
         if let Some(interval) = self.rotate_interval_secs {
-            let now_secs = SystemTime::now()
-                .duration_since(UNIX_EPOCH).unwrap().as_secs();
             let interval_n = now_secs / interval;
             if interval_n != self.last_interval_n {
                 self.last_interval_n = interval_n;

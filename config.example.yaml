@@ -25,6 +25,8 @@ mqtt:
 # Optional: JSONL logging with rotation
 # Remove this section if you don't need local logging
 log:
-  file: /var/log/tuya-meter.jsonl  # Log file path
+  file: /var/log/tuya-meter.jsonl  # Log file path; may contain date patterns
+                                   #   %Y %m %d %H %M %S (local time), e.g.
+                                   #   tuya-meter_%Y-%m-%d.jsonl -> new file each day
   max_lines: 10000                 # Rotate after N lines (optional)
   rotate_interval: "24h"           # Rotate every interval: "5h", "1d", "30m" (optional)

@@ -86,7 +86,7 @@ mqtt:
 
 # JSONL logging (optional, for server mode)
 log:
-  file: /var/log/tuya-meter.jsonl
+  file: /var/log/tuya-meter.jsonl   # may contain date patterns, e.g. tuya-meter_%Y-%m-%d.jsonl
   max_lines: 10000            # rotate after N lines
   rotate_interval: "24h"      # rotate every interval: "5h", "1d", "30m", "3600s"
 ```
@@ -126,6 +126,9 @@ Server mode maintains a persistent TCP connection to the device, receives data p
 - Rotation by line count (`max_lines`) and/or time interval (`rotate_interval`)
 - Keeps up to 3 rotated files (`.1`, `.2`, `.3`)
 - Supported intervals: `"30m"`, `"5h"`, `"1d"`, `"3600s"`
+- Date-based filenames: `file` may contain `%Y %m %d %H %M %S` patterns (local time),
+  e.g. `meter_%Y-%m-%d.jsonl` starts a new file at midnight — no renaming, old files
+  are kept as-is
 
 ### Example: log-only (no MQTT)
 
